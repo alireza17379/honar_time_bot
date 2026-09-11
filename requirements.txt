@@ -1,2 +1,5 @@
 aiogram>=3.22,<4
 qrcode[pil]>=8.2,<9
+
+opencv-python-headless>=4.10,<5
+numpy>=2.0,<3

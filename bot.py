@@ -3,6 +3,8 @@ import io
 import sqlite3
 import asyncio
 import logging
+
+import cv2
 from datetime import datetime, timedelta
 
 import qrcode
@@ -77,6 +79,12 @@ def init_db():
     cols = {r["name"] for r in c.execute("PRAGMA table_info(cards)").fetchall()}
     if "owner_name" not in cols:
         c.execute("ALTER TABLE cards ADD COLUMN owner_name TEXT NOT NULL DEFAULT ''")
+    # QR one-time-use migration
+    ocols = {r["name"] for r in c.execute("PRAGMA table_info(orders)").fetchall()}
+    if "used_at" not in ocols:
+        c.execute("ALTER TABLE orders ADD COLUMN used_at TEXT")
+    if "used_by" not in ocols:
+        c.execute("ALTER TABLE orders ADD COLUMN used_by INTEGER")
     c.commit(); c.close()
 
 
@@ -367,7 +375,7 @@ async def reject(q:CallbackQuery,bot:Bot):
 async def admin_panel(q:CallbackQuery,state:FSMContext):
     if not is_admin(q.from_user.id): return
     await state.clear()
-    rows=[[InlineKeyboardButton(text="➕ رویداد",callback_data="a:event"),InlineKeyboardButton(text="✏️ ویرایش رویداد",callback_data="a:edit_events")],[InlineKeyboardButton(text="➕ سانس",callback_data="a:show"),InlineKeyboardButton(text="✏️ ویرایش سانس",callback_data="a:edit_shows")],[InlineKeyboardButton(text="💺 ساخت/ویرایش صندلی‌ها",callback_data="a:seats_menu")],[InlineKeyboardButton(text="💳 کارت‌های بانکی",callback_data="a:cards")],[InlineKeyboardButton(text="🎁 تخفیف کاربر",callback_data="a:discount")],[InlineKeyboardButton(text="🖼 پوستر رویداد",callback_data="a:poster")],[InlineKeyboardButton(text="📊 گزارش فروش",callback_data="a:report")],[InlineKeyboardButton(text="🧾 سفارش‌های در انتظار",callback_data="a:pending")],[InlineKeyboardButton(text="🏠 منوی اصلی",callback_data="home")]]
+    rows=[[InlineKeyboardButton(text="➕ رویداد",callback_data="a:event"),InlineKeyboardButton(text="✏️ ویرایش رویداد",callback_data="a:edit_events")],[InlineKeyboardButton(text="➕ سانس",callback_data="a:show"),InlineKeyboardButton(text="✏️ ویرایش سانس",callback_data="a:edit_shows")],[InlineKeyboardButton(text="💺 ساخت/ویرایش صندلی‌ها",callback_data="a:seats_menu")],[InlineKeyboardButton(text="💳 کارت‌های بانکی",callback_data="a:cards")],[InlineKeyboardButton(text="🎁 تخفیف کاربر",callback_data="a:discount")],[InlineKeyboardButton(text="🖼 پوستر رویداد",callback_data="a:poster")],[InlineKeyboardButton(text="📊 گزارش فروش",callback_data="a:report")],[InlineKeyboardButton(text="🧾 سفارش‌های در انتظار",callback_data="a:pending")],[InlineKeyboardButton(text="📱 اسکن QR ورود",callback_data="scanqr")],[InlineKeyboardButton(text="🏠 منوی اصلی",callback_data="home")]]
     await edit_or_send(q,"👨‍💼 <b>پنل مدیریت</b>\n\nهمه گزینه‌های مدیریتی تا حد امکان در همین پیام نمایش داده می‌شوند.",K(rows)); await q.answer()
 
 
@@ -548,6 +556,122 @@ async def admin_edit_poster(message:Message,state:FSMContext):
     c=db(); c.execute("UPDATE events SET poster_file_id=? WHERE id=?",(message.photo[-1].file_id,eid)); c.commit(); c.close(); await finish_flow(message,state,f"✅ پوستر رویداد #{eid} تغییر کرد.",main_kb(message.from_user.id)); await state.clear()
 
 
+
+def decode_qr_photo(bot: Bot, file_id: str):
+    """Download a Telegram photo and decode a QR code with OpenCV."""
+    # This helper is async in practice because Telegram file download is async;
+    # kept as a separate decoder below for testability.
+    raise RuntimeError("use decode_qr_message")
+
+
+async def decode_qr_message(message: Message):
+    if not message.photo:
+        return None
+    try:
+        tg_file = await message.bot.get_file(message.photo[-1].file_id)
+        buf = io.BytesIO()
+        await message.bot.download_file(tg_file.file_path, buf)
+        data = buf.getvalue()
+        arr = __import__("numpy").frombuffer(data, dtype=__import__("numpy").uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+        detector = cv2.QRCodeDetector()
+        text, points, _ = detector.detectAndDecode(img)
+        return text.strip() if text else None
+    except Exception:
+        log.exception("QR decode failed")
+        return None
+
+
+async def scan_qr_prompt(q: CallbackQuery, state: FSMContext):
+    if not is_admin(q.from_user.id):
+        await q.answer("دسترسی ندارید.", show_alert=True); return
+    await state.clear()
+    await state.set_state("scan_qr")
+    await q.message.edit_text(
+        "📱 <b>اسکن QR ورود</b>\n\n"
+        "عکس QR بلیت را همینجا ارسال کنید.\n"
+        "پس از اولین اسکن، بلیت به‌صورت دائمی <b>مصرف‌شده</b> می‌شود و دوباره قابل استفاده نیست.\n\n"
+        "برای خروج، /start را بزنید."
+    )
+    await q.answer()
+
+
+async def scan_qr_photo(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    code = await decode_qr_message(message)
+    if not code:
+        await message.answer("❌ QR خوانده نشد. عکس واضح و کامل از QR بفرستید.")
+        return
+    c = db()
+    row = c.execute(
+        "SELECT o.*, e.title, e.kind, s.show_at, s.hall, se.label "
+        "FROM orders o JOIN shows s ON s.id=o.show_id "
+        "JOIN events e ON e.id=s.event_id JOIN seats se ON se.id=o.seat_id "
+        "WHERE o.ticket_code=? AND o.status='approved'", (code,)
+    ).fetchone()
+    if not row:
+        c.close()
+        await message.answer(f"❌ <b>QR نامعتبر است.</b>\nکد: <code>{code}</code>")
+        return
+    if row["used_at"]:
+        used_at = row["used_at"].replace("T", " ")
+        c.close()
+        await message.answer(
+            f"⛔ <b>این بلیت قبلاً استفاده شده است.</b>\n\n"
+            f"🎟 کد: <code>{code}</code>\n"
+            f"💺 صندلی: <b>{row['label']}</b>\n"
+            f"🕐 زمان استفاده: {used_at}"
+        )
+        return
+    # Atomic one-time consumption: only the first successful scan can update it.
+    cur = c.execute(
+        "UPDATE orders SET used_at=?, used_by=? WHERE id=? AND status='approved' AND used_at IS NULL",
+        (now_iso(), message.from_user.id, row["id"])
+    )
+    c.commit()
+    consumed = cur.rowcount == 1
+    c.close()
+    if not consumed:
+        await message.answer("⛔ این بلیت هم‌زمان توسط شخص دیگری مصرف شد. دوباره بررسی کنید.")
+        return
+    await state.clear()
+    await message.answer(
+        f"✅ <b>ورود تأیید شد</b>\n\n"
+        f"🎟 کد بلیت: <code>{code}</code>\n"
+        f"{icon(row['kind'])} {row['title']}\n"
+        f"🕐 {row['show_at']}\n"
+        f"🏛 {row['hall']}\n"
+        f"💺 صندلی: <b>{row['label']}</b>\n\n"
+        f"🟢 این QR اکنون <b>باطل/مصرف‌شده</b> است و مجدداً پذیرفته نمی‌شود."
+    )
+
+
+async def scan_qr_text(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id) or not message.text:
+        return
+    if await state.get_state() != "scan_qr":
+        return
+    code = message.text.strip()
+    c = db()
+    row = c.execute(
+        "SELECT o.*, e.title, e.kind, s.show_at, s.hall, se.label FROM orders o "
+        "JOIN shows s ON s.id=o.show_id JOIN events e ON e.id=s.event_id "
+        "JOIN seats se ON se.id=o.seat_id WHERE o.ticket_code=? AND o.status='approved'", (code,)
+    ).fetchone()
+    if not row:
+        c.close(); await message.answer("❌ کد بلیت معتبر نیست."); return
+    if row["used_at"]:
+        c.close(); await message.answer(f"⛔ این بلیت قبلاً استفاده شده است.\nزمان: {row['used_at'].replace('T',' ')}"); return
+    cur=c.execute("UPDATE orders SET used_at=?,used_by=? WHERE id=? AND status='approved' AND used_at IS NULL",(now_iso(),message.from_user.id,row['id']))
+    c.commit(); c.close()
+    if cur.rowcount != 1:
+        await message.answer("⛔ بلیت قبلاً توسط اسکن دیگری مصرف شده است."); return
+    await state.clear()
+    await message.answer(f"✅ ورود تأیید شد.\n🎟 <code>{code}</code>\n💺 صندلی: <b>{row['label']}</b>\n🟢 QR باطل شد و دوباره قابل استفاده نیست.")
+
 async def noop(q:CallbackQuery): await q.answer("این صندلی در حال حاضر آزاد نیست.",show_alert=True)
 
 async def home(q:CallbackQuery):
@@ -566,11 +690,11 @@ async def main():
     dp.callback_query.register(admin_action,F.data.startswith("a:")); dp.callback_query.register(event_manage,F.data.startswith("evm:")); dp.callback_query.register(event_edit_prompt,F.data.startswith("eve:")); dp.callback_query.register(event_poster_prompt,F.data.startswith("evp:")); dp.callback_query.register(event_toggle,F.data.startswith("evt:"))
     dp.callback_query.register(show_manage,F.data.startswith("shm:")); dp.callback_query.register(show_edit_prompt,F.data.startswith("she:")); dp.callback_query.register(show_toggle,F.data.startswith("sht:")); dp.callback_query.register(seat_manage,F.data.startswith("sm:")); dp.callback_query.register(seat_edit_prompt,F.data.startswith("se:"))
     dp.callback_query.register(card_manage,F.data.startswith("cm:")); dp.callback_query.register(card_edit_prompt,F.data.startswith("ce:")); dp.callback_query.register(card_toggle,F.data.startswith("ct:")); dp.callback_query.register(receipt_view,F.data.startswith("receiptview:"))
-    dp.callback_query.register(event_detail,F.data.startswith("event:")); dp.callback_query.register(cancel_reservation,F.data.startswith("cancel:")); dp.callback_query.register(seat_page,F.data.startswith("seatpage:")); dp.callback_query.register(show_detail,F.data.startswith("show:")); dp.callback_query.register(seat_pick,F.data.startswith("seat:")); dp.callback_query.register(choose_card,F.data.startswith("paycard:")); dp.callback_query.register(approve,F.data.startswith("approve:")); dp.callback_query.register(reject,F.data.startswith("reject:")); dp.callback_query.register(noop,F.data=="noop")
+    dp.callback_query.register(scan_qr_prompt,F.data=="scanqr"); dp.callback_query.register(event_detail,F.data.startswith("event:")); dp.callback_query.register(cancel_reservation,F.data.startswith("cancel:")); dp.callback_query.register(seat_page,F.data.startswith("seatpage:")); dp.callback_query.register(show_detail,F.data.startswith("show:")); dp.callback_query.register(seat_pick,F.data.startswith("seat:")); dp.callback_query.register(choose_card,F.data.startswith("paycard:")); dp.callback_query.register(approve,F.data.startswith("approve:")); dp.callback_query.register(reject,F.data.startswith("reject:")); dp.callback_query.register(noop,F.data=="noop")
     dp.message.register(admin_poster,AdminState.poster,F.photo); dp.message.register(admin_edit_poster,AdminState.edit_poster,F.photo)
     for st in (AdminState.edit_event,AdminState.edit_show,AdminState.edit_card,AdminState.edit_seats): dp.message.register(admin_edit_text,st,F.text)
     for st in (AdminState.event,AdminState.show,AdminState.seats,AdminState.card,AdminState.discount,AdminState.poster): dp.message.register(admin_text,st,F.text)
-    dp.message.register(receipt,F.photo)
+    dp.message.register(scan_qr_photo,F.photo); dp.message.register(scan_qr_text,F.text); dp.message.register(receipt,F.photo)
     await dp.start_polling(bot)
 
 if __name__=="__main__": asyncio.run(main())
