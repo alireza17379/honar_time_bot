@@ -212,6 +212,15 @@ async def show_detail(q: CallbackQuery):
     clean_holds(); sid=int(q.data.split(":")[1]); c=db()
     s=c.execute("SELECT s.*,e.title,e.kind,e.event_id FROM shows s JOIN events e ON e.id=s.event_id WHERE s.id=? AND s.active=1",(sid,)).fetchone()
     seats=c.execute("SELECT * FROM seats WHERE show_id=? ORDER BY id",(sid,)).fetchall() if s else []
+    # Existing shows created without seat rows get a default 11x10 layout.
+    # Admins can change the capacity later from the management panel.
+    if s and not seats:
+        c.executemany(
+            "INSERT INTO seats(show_id,label,status) VALUES(?,?,'free')",
+            [(sid, f"{r}-{n}") for r in range(1, 12) for n in range(1, 11)]
+        )
+        c.commit()
+        seats=c.execute("SELECT * FROM seats WHERE show_id=? ORDER BY id",(sid,)).fetchall()
     c.close()
     if not s: await q.answer("سانس پیدا نشد.",show_alert=True); return
     rows, per_row=seat_map_rows(seats)
