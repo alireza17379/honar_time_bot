@@ -12,7 +12,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile, InputMediaPhoto
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("honar_time_bot")
@@ -158,12 +158,54 @@ async def events(q: CallbackQuery):
 
 
 async def event_detail(q: CallbackQuery):
-    eid=int(q.data.split(":")[1]); c=db(); e=c.execute("SELECT * FROM events WHERE id=? AND active=1",(eid,)).fetchone(); shows=c.execute("SELECT * FROM shows WHERE event_id=? AND active=1 ORDER BY show_at",(eid,)).fetchall(); c.close()
+    eid=int(q.data.split(":")[1])
+    c=db(); e=c.execute("SELECT * FROM events WHERE id=? AND active=1",(eid,)).fetchone(); shows=c.execute("SELECT * FROM shows WHERE event_id=? AND active=1 ORDER BY show_at",(eid,)).fetchall(); c.close()
     if not e: await q.answer("رویداد پیدا نشد.",show_alert=True); return
     text=f"{icon(e['kind'])} <b>{e['title']}</b>\n\n{e['description'] or 'بدون توضیحات'}\n\n🕐 سانس را انتخاب کنید:"
-    rows=[[InlineKeyboardButton(text=f"🕐 {s['show_at']} | {s['hall']} | {money(s['base_price'])}",callback_data=f"cancel:{s['id']}")] for s in shows]
+    rows=[[InlineKeyboardButton(text=f"🕐 {s['show_at']} | {s['hall']} | {money(s['base_price'])}",callback_data=f"show:{s['id']}")] for s in shows]
     rows.append([InlineKeyboardButton(text="⬅️ رویدادها",callback_data="events")])
-    await edit_or_send(q,text,K(rows)); await q.answer()
+    markup=K(rows)
+    if e["poster_file_id"]:
+        try:
+            await q.message.edit_media(InputMediaPhoto(media=e["poster_file_id"],caption=text),reply_markup=markup)
+        except Exception:
+            try:
+                await q.message.delete()
+            except Exception:
+                pass
+            await q.message.answer_photo(e["poster_file_id"],caption=text,reply_markup=markup)
+    else:
+        await edit_or_send(q,text,markup)
+    await q.answer()
+
+
+def fa_digits(value):
+    return str(value).translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
+
+
+def seat_map_rows(seats):
+    seat_by_label={x["label"]:x for x in seats}
+    row_numbers=sorted({int(x["label"].split("-",1)[0]) for x in seats if "-" in x["label"]})
+    per_row=max([int(x["label"].split("-")[1]) for x in seats if "-" in x["label"]],default=0)
+    marks={"free":"🟩","held":"🟨","pending":"🟧","sold":"🟥"}
+    rows=[]
+    for r in row_numbers:
+        first=(r-1)*per_row+1
+        last=r*per_row
+        rows.append([InlineKeyboardButton(text=f"— ردیف {fa_digits(r)} | {fa_digits(first)} تا {fa_digits(last)} —",callback_data="noop")])
+        line=[]
+        for n in range(1,per_row+1):
+            seat=seat_by_label.get(f"{r}-{n}")
+            if not seat: continue
+            global_no=(r-1)*per_row+n
+            mark=marks.get(seat["status"],"⬜")
+            text=f"{mark} {fa_digits(global_no)}"
+            cb=f"seat:{seat['id']}" if seat["status"]=="free" else "noop"
+            line.append(InlineKeyboardButton(text=text,callback_data=cb))
+            if len(line)==5:
+                rows.append(line); line=[]
+        if line: rows.append(line)
+    return rows, per_row
 
 
 async def show_detail(q: CallbackQuery):
@@ -172,23 +214,20 @@ async def show_detail(q: CallbackQuery):
     seats=c.execute("SELECT * FROM seats WHERE show_id=? ORDER BY id",(sid,)).fetchall() if s else []
     c.close()
     if not s: await q.answer("سانس پیدا نشد.",show_alert=True); return
-    seat_by_label={x["label"]:x for x in seats}
-    row_numbers=sorted({int(x["label"].split("-",1)[0]) for x in seats if "-" in x["label"]})
-    marks={"free":"🟩","held":"🟨","pending":"🟧","sold":"🟥"}; rows=[]
-    per_row=max([int(x["label"].split("-",1)[1]) for x in seats if "-" in x["label"]],default=0)
-    for r in row_numbers:
-        line=[]
-        for n in range(1,per_row+1):
-            seat=seat_by_label.get(f"{r}-{n}")
-            if not seat: continue
-            global_no=(r-1)*per_row+n
-            if seat["status"]=="free": line.append(InlineKeyboardButton(text=f"🟩 {global_no}",callback_data=f"seat:{seat['id']}"))
-            else: line.append(InlineKeyboardButton(text=f"{marks.get(seat['status'],'⬜')} {global_no}",callback_data="noop"))
-            if n==per_row//2: line.append(InlineKeyboardButton(text="↔️",callback_data="noop"))
-        rows.append(line)
-    rows.append([InlineKeyboardButton(text="🔄 به‌روزرسانی",callback_data=f"show:{sid}")]); rows.append([InlineKeyboardButton(text="⬅️ بازگشت",callback_data=f"event:{s['event_id']}")])
-    text=f"{icon(s['kind'])} <b>{s['title']}</b>\n🕐 {s['show_at']} | {s['hall']}\n💰 قیمت پایه: {money(s['base_price'])}\n💺 تعداد: {len(seats)} صندلی\n\n🟩 آزاد  🟨 رزرو موقت  🟧 در انتظار تأیید  🟥 فروخته‌شده\n\nشماره صندلی‌ها از ۱ به‌صورت پیوسته و به تفکیک ردیف نمایش داده می‌شوند:\n\n💺 صندلی را انتخاب کنید:"
-    await edit_or_send(q,text,K(rows)); await q.answer()
+    rows, per_row=seat_map_rows(seats)
+    rows.append([InlineKeyboardButton(text="🔄 به‌روزرسانی",callback_data=f"show:{sid}")])
+    rows.append([InlineKeyboardButton(text="⬅️ بازگشت به رویداد",callback_data=f"event:{s['event_id']}")])
+    text=(f"{icon(s['kind'])} <b>{s['title']}</b>\n"
+          f"🕐 {s['show_at']} | 🏛 {s['hall']}\n"
+          f"💰 قیمت: {money(s['base_price'])}\n"
+          f"💺 {fa_digits(len(seats))} صندلی | {fa_digits((len(seats)+per_row-1)//per_row if per_row else 0)} ردیف\n\n"
+          "🟩 آزاد  🟨 رزرو موقت  🟧 در انتظار  🟥 فروخته‌شده\n\n"
+          "💺 <b>انتخاب صندلی</b>\nهر ردیف جداست؛ شماره‌ها پیوسته‌اند.")
+    try:
+        await q.message.answer(text,reply_markup=K(rows))
+    except Exception:
+        await q.answer("ارسال نقشه صندلی انجام نشد. دوباره تلاش کنید.",show_alert=True); return
+    await q.answer()
 
 
 async def seat_pick(q: CallbackQuery,state:FSMContext):
