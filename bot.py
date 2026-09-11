@@ -223,11 +223,20 @@ async def show_detail(q: CallbackQuery):
           f"💺 {fa_digits(len(seats))} صندلی | {fa_digits((len(seats)+per_row-1)//per_row if per_row else 0)} ردیف\n\n"
           "🟩 آزاد  🟨 رزرو موقت  🟧 در انتظار  🟥 فروخته‌شده\n\n"
           "💺 <b>انتخاب صندلی</b>\nهر ردیف جداست؛ شماره‌ها پیوسته‌اند.")
+    # Seat map MUST be a brand-new Telegram message. Do not edit the
+    # event/show message, especially when the previous message contains a poster/photo.
+    seat_text=(f"💺 <b>انتخاب صندلی</b>\n\n"
+               f"🎭 {s['title']}\n"
+               f"🕐 {s['show_at']} | 🏛 {s['hall']}\n"
+               f"💰 قیمت هر صندلی: {money(s['base_price'])}\n\n"
+               f"🟩 آزاد  🟨 رزرو موقت  🟧 در انتظار  🟥 فروخته‌شده\n"
+               f"\nشماره صندلی‌ها از ۱ تا {fa_digits(len(seats))} به‌صورت پیوسته و به تفکیک ردیف نمایش داده شده‌اند.\n"
+               f"روی صندلی موردنظر بزنید:")
     try:
-        await q.message.answer(text,reply_markup=K(rows))
+        await q.message.chat.send_message(text=seat_text, reply_markup=K(rows))
     except Exception:
         await q.answer("ارسال نقشه صندلی انجام نشد. دوباره تلاش کنید.",show_alert=True); return
-    await q.answer()
+    await q.answer("نقشه صندلی در پیام جدید ارسال شد.")
 
 
 async def seat_pick(q: CallbackQuery,state:FSMContext):
