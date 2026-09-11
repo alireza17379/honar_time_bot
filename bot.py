@@ -10,7 +10,7 @@ from aiogram.enums import ParseMode
 import qrcode
 
 TOKEN=os.getenv("BOT_TOKEN","").strip()
-ADMIN_ID=int(os.getenv("ADMIN_ID","0"))
+ADMIN_IDS=[int(x.strip()) for x in os.getenv("ADMIN_IDS","").split(",") if x.strip().isdigit()]
 DB=os.getenv("DB_PATH","honar_time.db")
 bot=Bot(TOKEN,default=DefaultBotProperties(parse_mode=ParseMode.HTML)); dp=Dispatcher()
 
@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY AUTOINCREMENT,code TEX
 def K(rows): return InlineKeyboardMarkup(inline_keyboard=rows)
 def mainkb(): return K([[InlineKeyboardButton(text="🎬 خرید بلیت",callback_data="films")],[InlineKeyboardButton(text="🎟️ بلیت‌های من",callback_data="mine")],[InlineKeyboardButton(text="💳 اطلاعات پرداخت",callback_data="cards")],[InlineKeyboardButton(text="ℹ️ درباره ما",callback_data="about")]])
 def adminkb(): return K([[InlineKeyboardButton(text="💳 کارت‌های بانکی",callback_data="acards")],[InlineKeyboardButton(text="🎬 فیلم‌ها",callback_data="afilms")],[InlineKeyboardButton(text="🕐 سانس‌ها",callback_data="ashows")],[InlineKeyboardButton(text="💺 صندلی‌ها",callback_data="aseats")],[InlineKeyboardButton(text="🎁 تخفیف کاربران",callback_data="adiscount")],[InlineKeyboardButton(text="🧾 رسیدها",callback_data="areceipts")],[InlineKeyboardButton(text="📊 گزارش فروش",callback_data="report")]])
-def admin(x): return x==ADMIN_ID
+def admin(x): return x in ADMIN_IDS
 class S(StatesGroup):
     bank=State(); number=State(); owner=State()
     title=State(); price=State()
@@ -103,7 +103,7 @@ async def photo(m):
     sid,seatid,amount=pending.pop(m.from_user.id); c=db(); s=c.execute("SELECT * FROM seats WHERE id=? AND show_id=? AND status='free'",(seatid,sid)).fetchone()
     if not s:c.close(); await m.answer("❌ صندلی دیگر آزاد نیست."); return
     fid=m.photo[-1].file_id; c.execute("UPDATE seats SET status='pending',user_id=?,receipt=? WHERE id=?",(m.from_user.id,fid,seatid)); c.commit(); c.close()
-    await bot.send_photo(ADMIN_ID,fid,caption=f"🧾 رسید جدید\n👤 {m.from_user.id}\n💺 {s['seat']}\n💰 {amount:,} تومان",reply_markup=K([[InlineKeyboardButton(text="✅ تأیید",callback_data=f"ok:{seatid}:{m.from_user.id}:{amount}")],[InlineKeyboardButton(text="❌ رد",callback_data=f"no:{seatid}:{m.from_user.id}")]]))
+    await asyncio.gather(*[bot.send_photo(aid,fid,caption=f"🧾 رسید جدید\n👤 {m.from_user.id}\n💺 {s['seat']}\n💰 {amount:,} تومان",reply_markup=K([[InlineKeyboardButton(text="✅ تأیید",callback_data=f"ok:{seatid}:{m.from_user.id}:{amount}")],[InlineKeyboardButton(text="❌ رد",callback_data=f"no:{seatid}:{m.from_user.id}")]])) for aid in ADMIN_IDS])
     await m.answer("✅ رسید دریافت شد و برای مدیریت ارسال شد.")
 
 def make_code():return "HT-"+datetime.now().strftime("%y%m%d%H%M%S%f")[-10:]
@@ -243,7 +243,7 @@ async def areceipts(q):
 async def vr(q):
     if not admin(q.from_user.id):return
     sid=int(q.data.split(":")[1]);c=db();x=c.execute("SELECT * FROM seats WHERE id=? AND status='pending'",(sid,)).fetchone();c.close()
-    await bot.send_photo(ADMIN_ID,x["receipt"],caption=f"🧾 بررسی\n👤 {x['user_id']}\n💺 {x['seat']}",reply_markup=K([[InlineKeyboardButton(text="✅ تأیید",callback_data=f"ok:{sid}:{x['user_id']}:0")],[InlineKeyboardButton(text="❌ رد",callback_data=f"no:{sid}:{x['user_id']}")]]));await q.answer()
+    await asyncio.gather(*[bot.send_photo(aid,x["receipt"],caption=f"🧾 بررسی\n👤 {x['user_id']}\n💺 {x['seat']}",reply_markup=K([[InlineKeyboardButton(text="✅ تأیید",callback_data=f"ok:{sid}:{x['user_id']}:0")],[InlineKeyboardButton(text="❌ رد",callback_data=f"no:{sid}:{x['user_id']}")]])) for aid in ADMIN_IDS]);await q.answer()
 @dp.callback_query(F.data=="report")
 async def report(q):
     if not admin(q.from_user.id):return
@@ -255,6 +255,6 @@ async def ap(q):
     await q.answer()
 
 async def main():
-    if not TOKEN or not ADMIN_ID: raise RuntimeError("BOT_TOKEN و ADMIN_ID را تنظیم کنید.")
+    if not TOKEN or not ADMIN_IDS: raise RuntimeError("BOT_TOKEN و ADMIN_IDS را تنظیم کنید.")
     init(); await dp.start_polling(bot)
 if __name__=="__main__":asyncio.run(main())
