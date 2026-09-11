@@ -226,23 +226,32 @@ async def show_detail(q: CallbackQuery):
     c.close()
     if not s:
         await q.answer("سانس پیدا نشد.", show_alert=True); return
-    rows, line = [], []
-    for seat in seats:
-        marks = {"free":"🟩", "held":"🟨", "pending":"🟧", "sold":"🟥"}
-        if seat["status"] == "free":
-            b = InlineKeyboardButton(
-                text=f"🟩 {seat['label']}",
-                callback_data=f"seat:{seat['id']}"
-            )
-        else:
-            b = InlineKeyboardButton(
-                text=f"{marks.get(seat['status'],'⬜')} {seat['label']}",
-                callback_data="noop"
-            )
-        line.append(b)
-        if len(line) == 4:
-            rows.append(line); line = []
-    if line: rows.append(line)
+    # سالن: هر ردیف ۱۰ صندلی دارد؛ ۵ صندلی سمت چپ، یک فاصله در وسط، و ۵ صندلی سمت راست.
+    # ترتیب شماره‌ها در هر ردیف: ۱ تا ۵ | ۶ تا ۱۰
+    marks = {"free":"🟩", "held":"🟨", "pending":"🟧", "sold":"🟥"}
+    seat_by_label = {seat["label"]: seat for seat in seats}
+    rows = []
+    row_numbers = sorted({int(seat["label"].split("-", 1)[0]) for seat in seats if "-" in seat["label"]})
+
+    for r in row_numbers:
+        left, right = [], []
+        for n in range(1, 11):
+            seat = seat_by_label.get(f"{r}-{n}")
+            if not seat:
+                continue
+            if seat["status"] == "free":
+                b = InlineKeyboardButton(
+                    text=f"🟩 {n}",
+                    callback_data=f"seat:{seat['id']}"
+                )
+            else:
+                b = InlineKeyboardButton(
+                    text=f"{marks.get(seat['status'],'⬜')} {n}",
+                    callback_data="noop"
+                )
+            (left if n <= 5 else right).append(b)
+        # فاصلهٔ وسط، مطابق نقشهٔ سالن
+        rows.append(left + [InlineKeyboardButton(text="↔️", callback_data="noop")] + right)
     rows.append([InlineKeyboardButton(text="🔄 به‌روزرسانی", callback_data=f"show:{sid}")])
     rows.append([InlineKeyboardButton(text="⬅️ بازگشت", callback_data=f"event:{s['event_id']}")])
     text = (
