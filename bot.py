@@ -183,13 +183,25 @@ def fa_digits(value):
     return str(value).translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
 
 
-def seat_map_rows(seats):
+def seat_map_rows(seats, page=1, rows_per_page=5):
+    """Build a paginated seat keyboard so Telegram never receives >100 buttons."""
     seat_by_label={x["label"]:x for x in seats}
-    row_numbers=sorted({int(x["label"].split("-",1)[0]) for x in seats if "-" in x["label"]})
-    per_row=max([int(x["label"].split("-")[1]) for x in seats if "-" in x["label"]],default=0)
+    parsed=[]
+    for x in seats:
+        try:
+            r,n=map(int,x["label"].split("-",1)); parsed.append((r,n,x))
+        except Exception:
+            continue
+    row_numbers=sorted({r for r,_,_ in parsed})
+    per_row=max([n for _,n,_ in parsed],default=0)
+    if not row_numbers or not per_row:
+        return [], per_row, 1, 1
+    total_pages=max(1,(len(row_numbers)+rows_per_page-1)//rows_per_page)
+    page=max(1,min(page,total_pages))
+    selected_rows=row_numbers[(page-1)*rows_per_page:page*rows_per_page]
     marks={"free":"🟩","held":"🟨","pending":"🟧","sold":"🟥"}
     rows=[]
-    for r in row_numbers:
+    for r in selected_rows:
         first=(r-1)*per_row+1
         last=r*per_row
         rows.append([InlineKeyboardButton(text=f"— ردیف {fa_digits(r)} | {fa_digits(first)} تا {fa_digits(last)} —",callback_data="noop")])
@@ -199,53 +211,70 @@ def seat_map_rows(seats):
             if not seat: continue
             global_no=(r-1)*per_row+n
             mark=marks.get(seat["status"],"⬜")
-            text=f"{mark} {fa_digits(global_no)}"
             cb=f"seat:{seat['id']}" if seat["status"]=="free" else "noop"
-            line.append(InlineKeyboardButton(text=text,callback_data=cb))
+            line.append(InlineKeyboardButton(text=f"{mark} {fa_digits(global_no)}",callback_data=cb))
             if len(line)==5:
                 rows.append(line); line=[]
         if line: rows.append(line)
-    return rows, per_row
+    nav=[]
+    if page>1: nav.append(InlineKeyboardButton(text="⬅️ صفحه قبل",callback_data=f"seatpage:{seats[0]['show_id']}:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{fa_digits(page)} / {fa_digits(total_pages)}",callback_data="noop"))
+    if page<total_pages: nav.append(InlineKeyboardButton(text="صفحه بعد ➡️",callback_data=f"seatpage:{seats[0]['show_id']}:{page+1}"))
+    if nav: rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔄 به‌روزرسانی",callback_data=f"seatpage:{seats[0]['show_id']}:{page}")])
+    rows.append([InlineKeyboardButton(text="⬅️ بازگشت به رویداد",callback_data=f"event:{seats[0]['event_id']}" if seats and 'event_id' in seats[0].keys() else "events")])
+    return rows, per_row, page, total_pages
+
+
+async def render_seat_message(chat, sid, page=1, edit_message=None):
+    clean_holds()
+    c=db()
+    s=c.execute("SELECT s.*,e.title,e.kind,e.event_id FROM shows s JOIN events e ON e.id=s.event_id WHERE s.id=? AND s.active=1",(sid,)).fetchone()
+    seats=c.execute("SELECT se.*,s.event_id FROM seats se JOIN shows s ON s.id=se.show_id WHERE se.show_id=? ORDER BY se.id",(sid,)).fetchall() if s else []
+    if s and not seats:
+        c.executemany("INSERT INTO seats(show_id,label,status) VALUES(?,?,'free')",[(sid,f"{r}-{n}") for r in range(1,12) for n in range(1,11)])
+        c.commit()
+        seats=c.execute("SELECT se.*,s.event_id FROM seats se JOIN shows s ON s.id=se.show_id WHERE se.show_id=? ORDER BY se.id",(sid,)).fetchall()
+    c.close()
+    if not s: return False
+    rows, per_row, page, total_pages=seat_map_rows(seats,page)
+    row_count=len({x['label'].split('-')[0] for x in seats if '-' in x['label']})
+    text=(
+        f"💺 <b>انتخاب صندلی</b>\n\n"
+        f"🎭 {s['title']}\n"
+        f"🕐 {s['show_at']} | 🏛 {s['hall']}\n"
+        f"💰 قیمت هر صندلی: {money(s['base_price'])}\n\n"
+        f"🟩 آزاد  🟨 رزرو موقت  🟧 در انتظار  🟥 فروخته‌شده\n\n"
+        f"صفحه {fa_digits(page)} از {fa_digits(total_pages)} — هر بار {fa_digits(min(5,row_count))} ردیف نمایش داده می‌شود.\n"
+        "روی صندلی آزاد بزنید:"
+    )
+    if edit_message:
+        await edit_message.edit_text(text,reply_markup=K(rows))
+    else:
+        await chat.send_message(text=text,reply_markup=K(rows))
+    return True
 
 
 async def show_detail(q: CallbackQuery):
-    clean_holds(); sid=int(q.data.split(":")[1]); c=db()
-    s=c.execute("SELECT s.*,e.title,e.kind,e.event_id FROM shows s JOIN events e ON e.id=s.event_id WHERE s.id=? AND s.active=1",(sid,)).fetchone()
-    seats=c.execute("SELECT * FROM seats WHERE show_id=? ORDER BY id",(sid,)).fetchall() if s else []
-    # Existing shows created without seat rows get a default 11x10 layout.
-    # Admins can change the capacity later from the management panel.
-    if s and not seats:
-        c.executemany(
-            "INSERT INTO seats(show_id,label,status) VALUES(?,?,'free')",
-            [(sid, f"{r}-{n}") for r in range(1, 12) for n in range(1, 11)]
-        )
-        c.commit()
-        seats=c.execute("SELECT * FROM seats WHERE show_id=? ORDER BY id",(sid,)).fetchall()
-    c.close()
-    if not s: await q.answer("سانس پیدا نشد.",show_alert=True); return
-    rows, per_row=seat_map_rows(seats)
-    rows.append([InlineKeyboardButton(text="🔄 به‌روزرسانی",callback_data=f"show:{sid}")])
-    rows.append([InlineKeyboardButton(text="⬅️ بازگشت به رویداد",callback_data=f"event:{s['event_id']}")])
-    text=(f"{icon(s['kind'])} <b>{s['title']}</b>\n"
-          f"🕐 {s['show_at']} | 🏛 {s['hall']}\n"
-          f"💰 قیمت: {money(s['base_price'])}\n"
-          f"💺 {fa_digits(len(seats))} صندلی | {fa_digits((len(seats)+per_row-1)//per_row if per_row else 0)} ردیف\n\n"
-          "🟩 آزاد  🟨 رزرو موقت  🟧 در انتظار  🟥 فروخته‌شده\n\n"
-          "💺 <b>انتخاب صندلی</b>\nهر ردیف جداست؛ شماره‌ها پیوسته‌اند.")
-    # Seat map MUST be a brand-new Telegram message. Do not edit the
-    # event/show message, especially when the previous message contains a poster/photo.
-    seat_text=(f"💺 <b>انتخاب صندلی</b>\n\n"
-               f"🎭 {s['title']}\n"
-               f"🕐 {s['show_at']} | 🏛 {s['hall']}\n"
-               f"💰 قیمت هر صندلی: {money(s['base_price'])}\n\n"
-               f"🟩 آزاد  🟨 رزرو موقت  🟧 در انتظار  🟥 فروخته‌شده\n"
-               f"\nشماره صندلی‌ها از ۱ تا {fa_digits(len(seats))} به‌صورت پیوسته و به تفکیک ردیف نمایش داده شده‌اند.\n"
-               f"روی صندلی موردنظر بزنید:")
     try:
-        await q.message.chat.send_message(text=seat_text, reply_markup=K(rows))
-    except Exception:
-        await q.answer("ارسال نقشه صندلی انجام نشد. دوباره تلاش کنید.",show_alert=True); return
+        ok=await render_seat_message(q.message.chat,int(q.data.split(":")[1]),1)
+    except Exception as e:
+        log.exception("seat map send failed")
+        await q.answer("نقشه صندلی ارسال نشد. احتمالاً نسخه قبلی محدودیت تعداد دکمه داشت؛ لطفاً دوباره بزنید.",show_alert=True)
+        return
+    if not ok:
+        await q.answer("سانس پیدا نشد.",show_alert=True); return
     await q.answer("نقشه صندلی در پیام جدید ارسال شد.")
+
+
+async def seat_page(q: CallbackQuery):
+    try:
+        _,sid,page=q.data.split(":")
+        ok=await render_seat_message(q.message.chat,int(sid),int(page),edit_message=q.message)
+        await q.answer("" if ok else "سانس پیدا نشد.",show_alert=not ok)
+    except Exception:
+        log.exception("seat page failed")
+        await q.answer("نمایش صفحه صندلی‌ها انجام نشد.",show_alert=True)
 
 
 async def seat_pick(q: CallbackQuery,state:FSMContext):
@@ -537,7 +566,7 @@ async def main():
     dp.callback_query.register(admin_action,F.data.startswith("a:")); dp.callback_query.register(event_manage,F.data.startswith("evm:")); dp.callback_query.register(event_edit_prompt,F.data.startswith("eve:")); dp.callback_query.register(event_poster_prompt,F.data.startswith("evp:")); dp.callback_query.register(event_toggle,F.data.startswith("evt:"))
     dp.callback_query.register(show_manage,F.data.startswith("shm:")); dp.callback_query.register(show_edit_prompt,F.data.startswith("she:")); dp.callback_query.register(show_toggle,F.data.startswith("sht:")); dp.callback_query.register(seat_manage,F.data.startswith("sm:")); dp.callback_query.register(seat_edit_prompt,F.data.startswith("se:"))
     dp.callback_query.register(card_manage,F.data.startswith("cm:")); dp.callback_query.register(card_edit_prompt,F.data.startswith("ce:")); dp.callback_query.register(card_toggle,F.data.startswith("ct:")); dp.callback_query.register(receipt_view,F.data.startswith("receiptview:"))
-    dp.callback_query.register(event_detail,F.data.startswith("event:")); dp.callback_query.register(cancel_reservation,F.data.startswith("cancel:")); dp.callback_query.register(show_detail,F.data.startswith("show:")); dp.callback_query.register(seat_pick,F.data.startswith("seat:")); dp.callback_query.register(choose_card,F.data.startswith("paycard:")); dp.callback_query.register(approve,F.data.startswith("approve:")); dp.callback_query.register(reject,F.data.startswith("reject:")); dp.callback_query.register(noop,F.data=="noop")
+    dp.callback_query.register(event_detail,F.data.startswith("event:")); dp.callback_query.register(cancel_reservation,F.data.startswith("cancel:")); dp.callback_query.register(seat_page,F.data.startswith("seatpage:")); dp.callback_query.register(show_detail,F.data.startswith("show:")); dp.callback_query.register(seat_pick,F.data.startswith("seat:")); dp.callback_query.register(choose_card,F.data.startswith("paycard:")); dp.callback_query.register(approve,F.data.startswith("approve:")); dp.callback_query.register(reject,F.data.startswith("reject:")); dp.callback_query.register(noop,F.data=="noop")
     dp.message.register(admin_poster,AdminState.poster,F.photo); dp.message.register(admin_edit_poster,AdminState.edit_poster,F.photo)
     for st in (AdminState.edit_event,AdminState.edit_show,AdminState.edit_card,AdminState.edit_seats): dp.message.register(admin_edit_text,st,F.text)
     for st in (AdminState.event,AdminState.show,AdminState.seats,AdminState.card,AdminState.discount,AdminState.poster): dp.message.register(admin_text,st,F.text)
